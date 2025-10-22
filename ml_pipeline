@@ -1,0 +1,242 @@
+#!/usr/bin/env Rscript
+
+# ====== 加载必要包 ======
+suppressMessages({
+library(data.table)
+library(tidyverse)
+library(caret)
+library(mlr3)
+library(mlr3learners)
+library(mlr3verse)
+library(mlr3tuning)
+library(mlr3measures)
+library(mlr3viz)
+library(mlr3pipelines)
+library(mlr3extralearners)
+library(paradox)
+library(pROC)
+library(MLmetrics)
+library(optparse)
+library(lightgbm)
+library(catboost)}
+)
+
+# ====== 解析命令行参数 ======
+option_list <- list(
+  make_option(c("-f", "--feature"), type = "character", help = "Feature abundance file (tab-delimited)"),
+  make_option(c("-m", "--meta"), type = "character", help = "Meta file (tab-delimited)"),
+  make_option(c("-p", "--positive"), type = "character", help = "Positive disease group label"),
+  make_option(c("-o", "--prefix"), type = "character", default = "output", help = "Prefix for output files [default = %default]")
+)
+opt_parser <- OptionParser(option_list = option_list)
+opt <- parse_args(opt_parser)
+
+if (is.null(opt$feature) || is.null(opt$meta) || is.null(opt$positive)) {
+  print_help(opt_parser)
+  stop("必须提供 feature、meta 和 positive 参数", call. = FALSE)
+}
+
+positive_group <- opt$positive
+prefix <- opt$prefix
+# ====== 读取并预处理数据 ======
+feature_df <- read.delim(opt$feature, row.names = 1, check.names = FALSE) %>% t() %>% as.data.frame()
+feature_df$SampleID <- rownames(feature_df)
+meta_df <- read.delim(opt$meta, row.names = 1, check.names = FALSE) %>%
+  rownames_to_column("SampleID") %>% select(SampleID, group)
+
+data_all <- left_join(meta_df, feature_df, by = "SampleID") %>%
+  filter(!is.na(group)) %>%
+  mutate(group = factor(group)) %>%
+  mutate(group = relevel(group, ref = setdiff(levels(group), positive_group)[1]))
+
+# ====== 划分训练验证集 ======
+#set.seed(123)
+train_idx <- createDataPartition(data_all$group, p = 0.7, list = FALSE)
+train_data <- data_all[train_idx, ]
+valid_data <- data_all[-train_idx, ]
+
+x_train <- train_data %>% select(-SampleID, -group)
+y_train <- train_data$group
+x_valid <- valid_data %>% select(-SampleID, -group)
+y_valid <- valid_data$group
+x_all <- data_all %>% select(-SampleID, -group)
+y_all <- data_all$group
+
+# ====== 标准化处理 ======
+preproc <- preProcess(x_train, method = c("center", "scale"))
+x_train <- predict(preproc, x_train)
+x_valid <- predict(preproc, x_valid)
+x_all <- predict(preproc, x_all)
+
+# ====== 定义任务和模型列表 ======
+results <- list()
+pred_train_all <- list()
+pred_valid_all <- list()
+crossval_pred_all <- list()
+importance_all <- list()
+metrics_all <- data.frame()
+final_models <- list()
+
+task <- TaskClassif$new(id = "task", backend = data.table(x_train, group = y_train), target = "group", positive = positive_group)
+valid_task <- TaskClassif$new(id = "valid", backend = data.table(x_valid, group = y_valid), target = "group", positive = positive_group)
+
+learners <- list(
+  "logistic" = lrn("classif.log_reg", predict_type = "prob"),
+  "rf"       = lrn("classif.ranger", predict_type = "prob", importance = "impurity"),
+  "xgboost"  = lrn("classif.xgboost", predict_type = "prob"),
+  "lightgbm" = lrn("classif.lightgbm", predict_type = "prob"),
+  "catboost" = lrn("classif.catboost", predict_type = "prob"),
+  "svm"      = lrn("classif.svm", predict_type = "prob", kernel = "radial",type = "C-classification"),
+  "knn"      = lrn("classif.kknn", predict_type = "prob"),
+  "tree"     = lrn("classif.rpart", predict_type = "prob")
+)
+
+# 定义除logistic外其他模型的调参空间
+param_spaces <- list(
+  rf       = ps(num.trees = p_int(100, 500), mtry = p_int(1, 10), min.node.size = p_int(1, 5)),
+  xgboost  = ps(nrounds = p_int(50, 200), eta = p_dbl(0.01, 0.3), max_depth = p_int(3, 10)),
+  lightgbm = ps(num_iterations = p_int(50, 200), learning_rate = p_dbl(0.01, 0.3), max_depth = p_int(3, 10)),
+  catboost = ps(iterations = p_int(50, 200), learning_rate = p_dbl(0.01, 0.3), depth = p_int(3, 10)),
+  svm      = ps(cost = p_dbl(0.1, 10), gamma = p_dbl(0.001, 1)),
+  knn      = ps(k = p_int(3, 15)),
+  tree     = ps(cp = p_dbl(0.001, 0.1))
+)
+
+# ====== 定义 CI 函数 ======
+get_ci <- function(metric_fn, pred, truth, positive = NULL, n = 1000, conf = 0.95) {
+  boots <- replicate(n, {
+    idx <- sample(seq_along(truth), replace = TRUE)
+    if (!is.null(positive) && "positive" %in% names(formals(metric_fn))) {
+      metric_fn(pred[idx], truth[idx], positive = positive)
+    } else {
+      metric_fn(pred[idx], truth[idx])
+    }
+  })
+  quantile(boots, probs = c((1 - conf) / 2, 1 - (1 - conf) / 2), na.rm = TRUE)
+}
+
+# ====== 模型训练与评估 ======
+for (model_name in names(learners)) {
+  learner <- learners[[model_name]]
+  if (model_name == "logistic") {
+    final_learner <- learner
+    pred_cv <- resample(task, final_learner, rsmp("cv", folds = 5))$aggregate(msr("classif.auc"))
+    crossval_pred_all[[model_name]] <- resample(task, final_learner, rsmp("cv", folds = 5))$prediction()
+  } else {
+	param_set <- param_spaces[[model_name]]
+    at <- AutoTuner$new(
+      learner = learner,
+      resampling = rsmp("cv", folds = 5),
+      measure = msr("classif.auc"),
+      search_space = param_set,
+      #tuner = mlr3tuning::tnr("grid_search", resolution = 5),
+	  tuner = mlr3tuning::tnr("random_search"),
+      terminator = trm("evals", n_evals = 125)
+    )
+    at$train(task)
+    final_learner <- at$learner
+    final_learner$param_set$values <- at$learner$param_set$values
+	resampling <- rsmp("cv", folds = 5) ##交叉验证的预测值
+    resampling$instantiate(task)
+	crossval_pred_all[[model_name]] <- resample(task, final_learner, resampling, store_models = TRUE)$prediction()
+	crossval_pred_all[[model_name]] <- as.data.table(crossval_pred_all[[model_name]]) %>% mutate(SampleID=train_data$SampleID[crossval_pred_all[[model_name]]$row_ids])
+  }
+
+  # 训练模型
+  final_learner$train(task)
+
+  # 预测验证集
+  pred_valid <- final_learner$predict(valid_task)
+  prob_valid <- pred_valid$prob[, positive_group]
+  # 保存验证集预测概率
+  pred_valid_all[[model_name]] <- data.frame(SampleID = valid_data$SampleID, Prob = prob_valid)
+
+  # 找到最佳cutoff
+  label_valid <- y_valid
+  roc_obj <- roc(label_valid, prob_valid, levels = rev(levels(label_valid)))
+  cutoff <- coords(roc_obj, x = "best", best.method = "youden", ret = "threshold")$threshold
+  ## 如果有多个，取最接近 0.5 的
+  cutoff <- cutoff[which.min(abs(cutoff - 0.5))]
+
+  pred_class <- factor(ifelse(prob_valid > cutoff, positive_group, setdiff(levels(label_valid), positive_group)), levels = levels(label_valid))
+  truth_class <- factor(label_valid, levels = levels(label_valid))
+
+  # 分类评估
+  NPV <- function(pred, truth, positive) {
+    pred <- factor(pred, levels = levels(truth))
+    truth <- factor(truth, levels = levels(truth))
+    tn <- sum(pred != positive & truth != positive)  # True Negative
+    fn <- sum(pred != positive & truth == positive)  # False Negative
+    npv <- ifelse((tn + fn) == 0, NA, tn / (tn + fn))
+    return(npv)
+  }
+
+  auc <- auc(roc_obj)
+  ci_obj <- as.numeric(ci.auc(roc_obj, method = "bootstrap"))
+  acc <- Accuracy(pred_class, truth_class)
+  sen <- MLmetrics::Sensitivity(pred_class, truth_class, positive_group)
+  spe <- Specificity(pred_class, truth_class, positive_group)
+  ppv <- Precision(pred_class, truth_class, positive_group)
+  npv <- NPV(pred_class, truth_class, positive_group)
+  f1  <- F1_Score(pred_class, truth_class, positive_group)
+
+  # CI
+  acc_ci <- get_ci(Accuracy, pred_class, truth_class)  # 无需 positive
+  sen_ci <- get_ci(Sensitivity, pred_class, truth_class, positive = positive_group)
+  spe_ci <- get_ci(Specificity, pred_class, truth_class, positive = positive_group)
+  ppv_ci <- get_ci(Precision, pred_class, truth_class, positive = positive_group)
+  npv_ci <- get_ci(NPV, pred_class, truth_class, positive = positive_group)
+  f1_ci  <- get_ci(F1_Score, pred_class, truth_class, positive = positive_group)
+
+
+  metrics_all <- rbind(metrics_all, data.frame(
+    Model = model_name, AUC = auc, AUC_boost = ci_obj[2], AUC_Lower = ci_obj[1], AUC_Upper = ci_obj[3],
+    Accuracy = acc, Acc_Lower = acc_ci[1], Acc_Upper = acc_ci[2],
+    Sensitivity = sen, Sen_Lower = sen_ci[1], Sen_Upper = sen_ci[2],
+    Specificity = spe, Spe_Lower = spe_ci[1], Spe_Upper = spe_ci[2],
+    PPV = ppv, PPV_Lower = ppv_ci[1], PPV_Upper = ppv_ci[2],
+    NPV = npv, NPV_Lower = npv_ci[1], NPV_Upper = npv_ci[2],
+    F1 = f1, F1_Lower = f1_ci[1], F1_Upper = f1_ci[2],
+    Best_Cutoff = cutoff
+  ))
+
+  # 重新在全数据训练最终模型
+  final_task <- TaskClassif$new(id = "final", backend = data.table(x_all, group = y_all), target = "group", positive = positive_group)
+  final_model <- final_learner$clone(deep = TRUE)
+  final_model$train(final_task)
+  # 保存进模型列表
+  final_models[[model_name]] <- final_model
+  
+  # 变量重要性
+  if ("importance" %in% final_model$properties) {
+    imp <- tryCatch({
+      final_model$importance()
+    }, error = function(e) {
+      message(paste("Model", model_name, "importance extraction failed:", e$message))
+      return(NULL)
+    })
+    if (!is.null(imp)) {
+      importance_all[[model_name]] <- data.frame(Feature = names(imp), Importance = imp) %>%
+        arrange(desc(Importance))
+    }
+  }
+}
+
+# ====== 合并保存所有结果 ======
+save.image(file = paste0(prefix, ".RData"))
+write.table(metrics_all, file = paste0(prefix, "_valid_metrics_all.tsv"), sep = "\t", row.names = FALSE, quote = FALSE)
+
+dt_pred_all <- rbindlist(pred_valid_all, idcol = "Model")  #验证集score
+write.table(dt_pred_all, file = paste0(prefix, "_valid_score.tsv"), sep = "\t", row.names = FALSE, quote = FALSE)
+
+dt_crossval_pred_all <- rbindlist(  #交叉验证score
+  lapply(names(crossval_pred_all), function(model) {
+    pred <- crossval_pred_all[[model]]
+    dt <- as.data.table(pred)
+    dt[, Model := model]  # 添加模型列
+    return(dt)
+  }),
+  use.names = TRUE,
+  fill = TRUE
+)
+write.table(dt_crossval_pred_all, file = paste0(prefix, "_crossval_score.tsv"), sep = "\t", row.names = FALSE, quote = FALSE)
