@@ -1,0 +1,163 @@
+#!/usr/bin/env Rscript
+
+# ====== 加载必要包 ======
+suppressMessages({
+library(tidyverse)
+library(caret)
+library(pROC)
+library(MLmetrics)
+#library(binom)
+library(mlr3)
+library(data.table)})
+
+# ====== 命令行参数 ======
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) < 5) {
+  stop("用法: Rscript external_validation_with_metrics.R <new_feature.txt> <new_meta.txt> <modeling_environment.RData> <PositiveClassName> <OutputPrefix>")
+}
+
+feature_file <- args[1]
+meta_file <- args[2]
+model_file <- args[3]
+positive_class <- args[4]
+output_prefix <- args[5]
+
+# ====== 加载模型与标准化器 ======
+load(model_file)  # 包含 final_models 和 preproc
+
+# ====== 读取并准备新数据 ======
+
+new_meta <- read.delim(meta_file, row.names = 1, check.names = FALSE) %>% mutate(SampleID=NULL) %>% rownames_to_column("SampleID") %>% select(SampleID, group)
+tmp_feat <- read.delim(feature_file, row.names = 1, check.names = FALSE)
+if (length(intersect(colnames(tmp_feat), new_meta$SampleID)) > 0) {
+  new_feat <- t(tmp_feat) %>% as.data.frame()
+} else {
+  new_feat <- tmp_feat   
+}
+new_feat$SampleID <- rownames(new_feat)
+new_data <- left_join(new_meta, new_feat, by = "SampleID")
+if (!"group" %in% colnames(new_data)) stop("meta 文件中必须包含 'group' 列")
+
+# 设置标签顺序：以用户指定的 positive_class 为正类
+train_levels <- unique(train_data$group)
+new_levels <- unique(new_data$group)
+print(new_levels)
+if (length(new_levels) == 1) {
+    new_data$group <- rep(c(setdiff(train_levels, positive_group), positive_group),length.out = nrow(new_data))
+    new_data$group <- factor(new_data$group, levels = c(setdiff(train_levels, positive_group), positive_group))
+    positive_class <- positive_group
+}  else if (setequal(train_levels, new_levels)) {
+  new_data$group <- factor(new_data$group,levels=c(setdiff(new_levels, positive_class),positive_class))
+} else {
+  neg_group <- setdiff(train_levels, positive_group)
+  new_data$group <- ifelse(new_data$group==positive_class,positive_group,neg_group)
+  new_data$group <- factor(new_data$group,levels=c(neg_group,positive_group))
+  positive_class <- positive_group
+}
+print(positive_class)
+y_new <- new_data$group
+x_new <- new_data %>% select(-SampleID, -group)
+x_new_scaled <- predict(preproc, x_new)
+
+# ====== 模型评估函数（打分 + 95%CI） ======
+eval_model_external <- function(model, x, y_true, pos_label,sample_id = NULL, model_name = "model") {
+  if (!is.null(sample_id)) stopifnot(length(sample_id) == length(y_true))
+  # 构建新的 TaskClassif（不含标签）
+  task_new <- TaskClassif$new(id = "new", backend = data.table(x, group = y_true), target = "group", positive = pos_label)
+  pred <- model$predict(task_new)
+  prob <- pred$prob[, pos_label]
+
+  # 最佳cutoff
+  roc_obj <- roc(y_true, prob, levels = c(setdiff(levels(y_true), pos_label), pos_label))
+  auc_val <- as.numeric(auc(roc_obj))
+  ci_auc <- ci.auc(roc_obj, method = "bootstrap")
+  best_cut <- coords(roc_obj, "best", ret = "threshold", transpose = FALSE)
+  cutoff_candidates <- best_cut[["threshold"]]   # 提取所有候选阈值
+  cutoff <- cutoff_candidates[which.min(abs(cutoff_candidates - 0.5))]  # 选择最接近 0.5 的阈值
+  
+  pred_class <- factor(ifelse(prob >= cutoff, pos_label, setdiff(levels(y_true), pos_label)),
+                       levels = levels(y_true))
+
+  cm <- caret::confusionMatrix(pred_class, y_true, positive = pos_label)
+
+  # 置信区间计算函数
+  get_ci <- function(n, x) {
+    res <- binom.test(x, n)
+    c(est = res$estimate, lower = res$conf.int[1], upper = res$conf.int[2])
+  }
+
+  TP <- sum(y_true == pos_label & pred_class == pos_label)
+  TN <- sum(y_true != pos_label & pred_class != pos_label)
+  FP <- sum(y_true != pos_label & pred_class == pos_label)
+  FN <- sum(y_true == pos_label & pred_class != pos_label)
+
+  acc_ci <- get_ci(length(y_true), sum(pred_class == y_true))
+  sens_ci <- get_ci(TP + FN, TP)
+  spec_ci <- get_ci(TN + FP, TN)
+  ppv_ci  <- get_ci(TP + FP, TP)
+  npv_ci  <- get_ci(TN + FN, TN)
+
+  f1 <- F1_Score(y_true, pred_class, positive = pos_label)
+  precision <- ppv_ci[1]
+  recall <- sens_ci[1]
+  f1_ci_lower <- 2 * precision * recall / (precision + recall + 1.96 * sqrt((1 - precision) / (TP + FP) + (1 - recall) / (TP + FN)))
+  f1_ci_upper <- min(1, f1 + (f1 - f1_ci_lower))
+
+  pred_df <- data.frame( # 预测结果表
+    SampleID = if (is.null(sample_id)) seq_along(y_true) else sample_id,
+    TrueLabel = y_true,
+    PredProb = prob,
+    PredClass = pred_class,
+    Model = model_name
+  )
+  
+  metrics_df <- data.frame( # 评估指标表
+    Model = model_name,
+    AUC = auc_val,
+    AUC_lower = ci_auc[1],
+    AUC_upper = ci_auc[3],
+    Accuracy = acc_ci[1],
+    Acc_lower = acc_ci[2],
+    Acc_upper = acc_ci[3],
+    Sensitivity = sens_ci[1],
+    Sens_lower = sens_ci[2],
+    Sens_upper = sens_ci[3],
+    Specificity = spec_ci[1],
+    Spec_lower = spec_ci[2],
+    Spec_upper = spec_ci[3],
+    PPV = ppv_ci[1],
+    PPV_lower = ppv_ci[2],
+    PPV_upper = ppv_ci[3],
+    NPV = npv_ci[1],
+    NPV_lower = npv_ci[2],
+    NPV_upper = npv_ci[3],
+    F1 = f1,
+    F1_lower = f1_ci_lower,
+    F1_upper = f1_ci_upper,
+    Cutoff = cutoff
+  )
+   return(list(metrics = metrics_df, predictions = pred_df))
+}
+
+# ====== 应用于所有模型 ======
+model_names <- names(final_models)
+if (is.null(model_names)) model_names <- paste0("Model_", seq_along(final_models))
+
+external_eval_list <- purrr::map2(final_models, model_names, function(mod, name) {
+  eval_model_external(
+    model = mod,
+    x = x_new_scaled,
+    y_true = y_new,
+    pos_label = positive_class,
+    sample_id = new_data$SampleID,        # 可选，若有 SampleID 列
+    model_name = name
+  )
+})
+# 合并所有模型的评估指标与预测结果
+results_metrics <- purrr::map_df(external_eval_list, "metrics")
+results_preds   <- purrr::map_df(external_eval_list, "predictions")
+
+write.table(results_metrics, paste0(output_prefix, "_external_validation_metrics_withCI.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(results_preds, paste0(output_prefix, "_external_validation_score.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
