@@ -1,5 +1,5 @@
 #!/usr/bin/env Rscript
-
+## 修改正确了sen spe NPV等计算方向
 # ====== 加载必要包 ======
 suppressMessages({
 library(data.table)
@@ -105,14 +105,11 @@ param_spaces <- list(
 # ====== 定义 CI 函数 ======
 get_ci <- function(metric_fn, pred, truth, positive = NULL, n = 1000, conf = 0.95) {
   boots <- replicate(n, {
-    idx <- sample(seq_along(truth), replace = TRUE)
-    if (!is.null(positive) && "positive" %in% names(formals(metric_fn))) {
-      metric_fn(pred[idx], truth[idx], positive = positive)
-    } else {
-      metric_fn(pred[idx], truth[idx])
-    }
+    idx <- sample.int(length(truth), replace = TRUE)
+    if (is.null(positive)) metric_fn(y_pred = pred[idx], y_true = truth[idx])
+    else metric_fn(y_true = truth[idx], y_pred = pred[idx], positive = positive)
   })
-  quantile(boots, probs = c((1 - conf) / 2, 1 - (1 - conf) / 2), na.rm = TRUE)
+  unname(quantile(boots, c((1 - conf) / 2, 1 - (1 - conf) / 2), na.rm = TRUE))
 }
 
 # ====== 模型训练与评估 ======
@@ -162,32 +159,33 @@ for (model_name in names(learners)) {
   truth_class <- factor(label_valid, levels = levels(label_valid))
 
   # 分类评估
-  NPV <- function(pred, truth, positive) {
-    pred <- factor(pred, levels = levels(truth))
-    truth <- factor(truth, levels = levels(truth))
-    tn <- sum(pred != positive & truth != positive)  # True Negative
-    fn <- sum(pred != positive & truth == positive)  # False Negative
-    npv <- ifelse((tn + fn) == 0, NA, tn / (tn + fn))
-    return(npv)
-  }
+  NPV <- function(y_true, y_pred, positive) {
+  tn <- sum(y_true != positive & y_pred != positive)
+  fn <- sum(y_true == positive & y_pred != positive)
+  if (tn + fn == 0) return(NA_real_)
+  tn / (tn + fn)
+}
 
   auc <- auc(roc_obj)
   ci_obj <- as.numeric(ci.auc(roc_obj, method = "bootstrap"))
-  acc <- Accuracy(pred_class, truth_class)
-  sen <- MLmetrics::Sensitivity(pred_class, truth_class, positive_group)
-  spe <- Specificity(pred_class, truth_class, positive_group)
-  ppv <- Precision(pred_class, truth_class, positive_group)
-  npv <- NPV(pred_class, truth_class, positive_group)
-  f1  <- F1_Score(pred_class, truth_class, positive_group)
+  acc <- MLmetrics::Accuracy(y_pred = pred_class, y_true = truth_class)
+  sen <- MLmetrics::Sensitivity(y_true = truth_class, y_pred = pred_class, positive = positive_group)
+  spe <- MLmetrics::Specificity(y_true = truth_class, y_pred = pred_class, positive = positive_group)
+  ppv <- MLmetrics::Precision(y_true = truth_class, y_pred = pred_class, positive = positive_group)
+  npv <- NPV(y_true = truth_class, y_pred = pred_class, positive = positive_group)
+  f1  <- MLmetrics::F1_Score(y_true = truth_class, y_pred = pred_class, positive = positive_group)
 
-  # CI
-  acc_ci <- get_ci(Accuracy, pred_class, truth_class)  # 无需 positive
-  sen_ci <- get_ci(Sensitivity, pred_class, truth_class, positive = positive_group)
-  spe_ci <- get_ci(Specificity, pred_class, truth_class, positive = positive_group)
-  ppv_ci <- get_ci(Precision, pred_class, truth_class, positive = positive_group)
-  npv_ci <- get_ci(NPV, pred_class, truth_class, positive = positive_group)
-  f1_ci  <- get_ci(F1_Score, pred_class, truth_class, positive = positive_group)
-
+  # ====== Bootstrap 95% CI ======
+  acc_ci <- get_ci(MLmetrics::Accuracy, pred_class, truth_class)
+  sen_ci <- get_ci(MLmetrics::Sensitivity, pred_class, truth_class, positive_group)
+  spe_ci <- get_ci(MLmetrics::Specificity, pred_class, truth_class, positive_group)
+  ppv_ci <- get_ci(MLmetrics::Precision, pred_class, truth_class, positive_group)
+  npv_ci <- get_ci(NPV, pred_class, truth_class, positive_group)
+  f1_ci  <- get_ci(MLmetrics::F1_Score, pred_class, truth_class, positive_group)
+  
+   # 打印混淆矩阵，便于逐个模型核对
+  cat("\nModel:", model_name, "\n")
+  print(table(Actual = truth_class, Predicted = pred_class))
 
   metrics_all <- rbind(metrics_all, data.frame(
     Model = model_name, AUC = auc, AUC_boost = ci_obj[2], AUC_Lower = ci_obj[1], AUC_Upper = ci_obj[3],
@@ -240,3 +238,4 @@ dt_crossval_pred_all <- rbindlist(  #交叉验证score
   fill = TRUE
 )
 write.table(dt_crossval_pred_all, file = paste0(prefix, "_crossval_score.tsv"), sep = "\t", row.names = FALSE, quote = FALSE)
+
